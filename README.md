@@ -18,7 +18,8 @@ sudo redis-server /opt/local/etc/redis.conf
 
 launch the dramatiq workers:
 ```bash
-python -m dramatiq scanner
+#python -m dramatiq scanner
+python -m dramatiq scanner --watch .
 ```
 
 launch the scan in a separate terminal window:
