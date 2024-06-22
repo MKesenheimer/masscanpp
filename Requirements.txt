@@ -1,1 +1,6 @@
 python-masscan
+requests
+#dramatiq[rabbitmq, watch]
+dramatiq[redis, watch]
+pika
+redis
