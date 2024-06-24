@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import sys
+import os
+import glob
 import masscan
 import random
 import time
+import datetime
 import json
 import argparse
 import requests
@@ -16,11 +19,14 @@ from dramatiq.brokers.redis import RedisBroker
 from dramatiq.middleware import TimeLimitExceeded, Shutdown, CurrentMessage
 import signal
 import logging
+from pymongo import MongoClient
 
 broker = RedisBroker(host="127.0.0.1")
 broker.add_middleware(CurrentMessage())
 dramatiq.set_broker(broker)
-filename = "results.log"
+
+results_prefix = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_results"
+mongo_connection_string = "mongodb://127.0.0.1/"
 
 class http:
     def count_words(host: str, port: int) -> bytes:
@@ -29,8 +35,7 @@ class http:
             response = requests.get(url)
             count = len(response.text.split(" "))
             print(f"[+] there are {count} words at {url!r}.")
-            # TODO: convert response.text to bytes
-            return response.txt
+            return response.text.encode('utf-8')
         except Exception as e:
             print(f"[-] no response from {url!r}: {e}")
         return b''
@@ -69,6 +74,41 @@ class cola:
     send_request = send_cola_request
     receive_response = receive_cola_response
 
+class output:
+    @staticmethod
+    def create_object(ip: str, port: int, response: bytes):
+        data = {}
+        data['ip'] = ip
+        data['port'] = port
+        data['response'] = response.decode("utf-8")
+        data['length'] = len(response)
+        return data
+
+    @staticmethod
+    def write_response_to_file(ip: str, port: int, response: bytes):
+        json_data = json.dumps(output.create_object(ip, port, response))
+        filename = "./logs/" + results_prefix + f"_p{port}.json"
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write(json_data)
+            f.write('\n')
+
+    @staticmethod
+    def get_database():
+        client = MongoClient(mongo_connection_string)
+        # Create the database if none existent
+        return client['db']
+
+    @staticmethod
+    def push_to_database(ip: str, port: int, response: bytes):
+        dbname = output.get_database()
+        collection_name = dbname["scan-results"]
+        data = output.create_object(ip, port, response)
+        try:
+            collection_name.insert_one(data)
+        except Exception as e:
+            print(data)
+            print(f"Error occured: {e}")
+
 class ip_ping:
     def __init__(self, type_name):
         self.receive_response = type_name.receive_response
@@ -76,11 +116,10 @@ class ip_ping:
     def send_and_receive(self, ip: str, port: int):
         response = self.receive_response(ip, port)
         if response != b'':
-            with open(filename, 'a') as f:
-                f.write(f"response from {ip} {port}:\n")
-                f.write(str(response)+'\n')
+            #output.write_response_to_file(ip, port, response)
+            output.push_to_database(ip, port, response)
             print(f"[+] response from {ip} {port}:")
-            print(response)
+            print(f"{response[0:60]}...")
 
 class tcp_ping:
     def __init__(self, type_name):
@@ -103,11 +142,10 @@ class tcp_ping:
         finally:
             s.close()
         if response != b'':
-            with open(filename, 'a') as f:
-                f.write(f"response from {ip} {port}:\n")
-                f.write(str(response)+'\n')
+            #output.write_response_to_file(ip, port, response)
+            output.push_to_database(ip, port, response)
             print(f"[+] response from {ip} {port}:")
-            print(response)
+            print(f"{response[0:60]}...")
 
 @dramatiq.actor(max_age=3600000*24, time_limit=1000*60, notify_shutdown=True)
 def status(ip, port):
@@ -125,8 +163,8 @@ def status(ip, port):
         print(f"[-] verification status: shutdown {ip}:{port}")
         # restart next time if process was shut down -> raise error to middleware
         raise
-    except Exception:
-        print(f"[+] verification status: general exception {ip}:{port}")
+    except Exception as e:
+        print(f"[-] verification status: general exception {ip}:{port}: {e}")
     print(f"[+] verification status: finished {ip}:{port}")
 
 def scan(port=80):
@@ -170,7 +208,7 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--port', dest='port', help='Port to scan', type=int)
     args = parser.parse_args()
 
-    logging.basicConfig(filename="scan.log", filemode="a", format="%(asctime)s %(message)s", level=logging.INFO, force=True)
+    logging.basicConfig(filename=f"./logs/scan-{args.port}.log", filemode="a", format="%(asctime)s %(message)s", level=logging.INFO, force=True)
 
     try:
         scan(args.port)
