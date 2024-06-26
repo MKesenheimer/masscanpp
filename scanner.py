@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import sys
-import os
-import glob
 import masscan
 import random
 import time
@@ -12,12 +10,10 @@ import argparse
 import requests
 import socket
 from functools import reduce
-from collections.abc import Callable
-from multiprocessing import Process
+from abc import ABC, abstractmethod
 import dramatiq
 from dramatiq.brokers.redis import RedisBroker
 from dramatiq.middleware import TimeLimitExceeded, Shutdown, CurrentMessage
-import signal
 import logging
 from pymongo import MongoClient
 
@@ -28,7 +24,20 @@ dramatiq.set_broker(broker)
 results_prefix = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_results"
 mongo_connection_string = "mongodb://127.0.0.1/"
 
-class http:
+class protocol(ABC):
+    @abstractmethod
+    def send_request():
+        pass
+
+    @abstractmethod
+    def receive_response():
+        pass
+
+    @abstractmethod
+    def send_and_receive():
+        pass
+
+class http(protocol):
     def count_words(host: str, port: int) -> bytes:
         url = f"http://{host}:{port}/"
         try:
@@ -41,8 +50,12 @@ class http:
         return b''
     
     receive_response = count_words
+    send_request = None
 
-class cola:
+    def send_and_receive(host: str, port: int) -> bytes:
+        return receive_response(str, int)
+
+class cola(protocol):
     def send_cola_request(socket, port: int):
         #payload = b'sRI 0'
         #payload = b'sRN FirmwareVersion'
@@ -73,6 +86,10 @@ class cola:
 
     send_request = send_cola_request
     receive_response = receive_cola_response
+
+    def send_and_receive(socket, port: int) -> bytes:
+        send_request(socket, port)
+        return receive_response(socket, port)
 
 class output:
     @staticmethod
@@ -197,6 +214,9 @@ def scan(port=80):
                         logging.info(f"found open port: {ip} {state}")
                         print(f"[+] verifying status of {ip}:{port}")
                         status.send_with_options(args=(ip, port, ), delay=delay)
+                        for n in broker.get_declared_queues():
+                            queue_len = broker.do_qsize(n)
+                            print(f"[+] There are currently {queue_len} actors in queue dramatiq:{n}.")
                         delay += 1000
             except masscan.NetworkConnectionError:
                 print(f"[-] {ip_range} masscan masscan.NetworkConnectionError")

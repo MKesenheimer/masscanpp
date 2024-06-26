@@ -35,3 +35,15 @@ docker run -it --rm --name mongo-express -p 8081:8081 --network mongo-net -e ME_
 ```
 
 go to [mongo-express](http://127.0.0.1:8081) and log in with `admin` and `pass`.
+
+query the number of jobs in queue:
+```bash
+redis-cli
+> LLEN dramatiq:default
+```
+
+clear all keys from redis:
+```bash
+redis-cli
+> flushall
+```
