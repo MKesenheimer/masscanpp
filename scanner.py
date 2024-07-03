@@ -164,7 +164,12 @@ class tcp_ping:
             print(f"[+] response from {ip} {port}:")
             print(f"{response[0:60]}...")
 
-@dramatiq.actor(max_age=3600000*24, time_limit=1000*60, notify_shutdown=True)
+def print_queue_len():
+    for n in broker.get_declared_queues():
+        queue_len = broker.do_qsize(n)
+        print(f"[+] There are currently {queue_len} actors in queue dramatiq:{n}.")
+
+@dramatiq.actor(max_age=3600000*24, time_limit=1000*10, notify_shutdown=True)
 def status(ip, port):
     print(f"[+] verification status: start working on {ip}:{port}")
     try:
@@ -183,6 +188,7 @@ def status(ip, port):
     except Exception as e:
         print(f"[-] verification status: general exception {ip}:{port}: {e}")
     print(f"[+] verification status: finished {ip}:{port}")
+    print_queue_len()
 
 def scan(port=80):
     A = list(range(1, 0xff))
@@ -204,7 +210,7 @@ def scan(port=80):
             try:
                 mas = masscan.PortScanner()
                 mas.scan(ip_range, ports=str(port), arguments='--max-rate 1000000')
-                delay = 1000
+                delay = 100
                 scan_result = json.loads(mas.scan_result)
                 #print(scan_result['scan'])
                 for ip in scan_result['scan']:
@@ -214,9 +220,8 @@ def scan(port=80):
                         logging.info(f"found open port: {ip} {state}")
                         print(f"[+] verifying status of {ip}:{port}")
                         status.send_with_options(args=(ip, port, ), delay=delay)
-                        for n in broker.get_declared_queues():
-                            queue_len = broker.do_qsize(n)
-                            print(f"[+] There are currently {queue_len} actors in queue dramatiq:{n}.")
+                        #status.send_with_options(args=(ip, port, )) # without delay
+                        print_queue_len()
                         delay += 1000
             except masscan.NetworkConnectionError:
                 print(f"[-] {ip_range} masscan masscan.NetworkConnectionError")
