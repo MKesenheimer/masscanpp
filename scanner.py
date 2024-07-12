@@ -199,7 +199,6 @@ def scan(port=80):
     for a in A:
         for b in B:
             ip_range = f"{a}.{b}.0.0/16"
-            #ip_range = "45.33.32.156"
             ip_ranges.append(ip_range)
     
     while True:

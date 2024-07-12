@@ -5,7 +5,7 @@ mkdir -p databases
 mkdir -p logs
 mkdir -p redis
 
-docker network create masscan-net
+docker network create masscan-net 2> /dev/null
 
 # start the mongo servers
 docker run --rm --name mongodb -p 27017:27017 --network masscan-net -v $(pwd)/databases:/data/db -d mongo
