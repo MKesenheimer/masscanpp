@@ -8,6 +8,7 @@ import datetime
 import json
 import argparse
 import socket
+import ssl
 from functools import reduce
 from abc import ABC, abstractmethod
 import dramatiq
@@ -15,6 +16,10 @@ from dramatiq.brokers.redis import RedisBroker
 from dramatiq.middleware import TimeLimitExceeded, Shutdown, CurrentMessage
 import logging
 from pymongo import MongoClient
+
+# ignore TLS warnings
+#ssl._create_default_https_context = ssl._create_unverified_context
+ssl.SSLContext.verify_mode = property(lambda self: ssl.CERT_NONE, lambda self, newval: None)
 
 broker = RedisBroker(host="127.0.0.1")
 broker.add_middleware(CurrentMessage())
@@ -25,23 +30,14 @@ mongo_connection_string = "mongodb://127.0.0.1/"
 
 class protocol(ABC):
     @abstractmethod
-    def send_request():
-        pass
-
-    @abstractmethod
-    def receive_response():
-        pass
-
-    @abstractmethod
     def send_and_receive():
         pass
 
 class http(protocol):
-    def send_http_request(socket, ip: str, port: int):
+    def send_and_receive(socket, ip: str, port: int) -> bytes:
         request = f"GET / HTTP/1.1\r\nHost:{ip}\r\nConnection: close\r\n\r\n".encode()
         socket.sendall(request)
 
-    def receive_http_request(socket, ip: str, port: int) -> bytes:
         response = b""
         while True:
             chunk = socket.recv(4096)
@@ -51,11 +47,8 @@ class http(protocol):
             response = response + chunk
         return response
 
-    send_request = send_http_request
-    receive_response = receive_http_request
-
 class colaA(protocol):
-    def send_cola_request(socket, ip: str, port: int):
+    def send_and_receive(socket, ip: str, port: int) -> bytes:
         #payload = b'sRI 0'
         #payload = b'sRN FirmwareVersion'
         payload = b'sRN DeviceIdent'
@@ -64,15 +57,11 @@ class colaA(protocol):
         print(payload)
         socket.sendall(payload)
 
-    def receive_cola_response(socket, ip: str, port: int) -> bytes:
         response = socket.recv(1024)
         return response
 
-    send_request = send_cola_request
-    receive_response = receive_cola_response
-
 class colaB(protocol):
-    def send_cola_request(socket, ip: str, port: int):
+    def send_and_receive(socket, ip: str, port: int) -> bytes:
         #payload = b'sRI 0'
         #payload = b'sRN FirmwareVersion'
         payload = b'sRN DeviceIdent'
@@ -85,7 +74,6 @@ class colaB(protocol):
         print(payload)
         socket.sendall(payload)
 
-    def receive_cola_response(socket, ip: str, port: int) -> bytes:
         header = socket.recv(4)
         length = socket.recv(4)
         length = int.from_bytes(length, byteorder='big')
@@ -93,22 +81,13 @@ class colaB(protocol):
         crc = socket.recv(1)
         return response
 
-    send_request = send_cola_request
-    receive_response = receive_cola_response
-
 class ssh(protocol):
-    def send_ssh_request(socket, ip: str, port: int):
-        pass
-
-    def receive_ssh_response(socket, ip: str, port: int) -> bytes:
+    def send_and_receive(socket, ip: str, port: int) -> bytes:
         response = socket.recv(1024)
         if b"SSH-" in response:
             return response
         else:
             return b""
-
-    send_request = send_ssh_request
-    receive_response = receive_ssh_response
 
 class output:
     @staticmethod
@@ -146,9 +125,8 @@ class output:
             print(f"Error occured: {e}")
 
 class connection_handler:
-    def __init__(self, type_name):
-        self.send_request = type_name.send_request
-        self.receive_response = type_name.receive_response
+    def __init__(self, protocol):
+        self.protocol_send_and_receive = protocol.send_and_receive
 
     def send_and_receive(self, ip: str, port: int):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -160,14 +138,40 @@ class connection_handler:
             return
         response = b''
         try:
-            self.send_request(s, ip, port)
-            response = self.receive_response(s, ip, port)
+            response = self.protocol_send_and_receive(s, ip, port)
         except socket.timeout as e:
             print(f"[-] verification failed for {ip}:{port} with socket timeout: {e}")
         except Exception as e:
             print(f"[-] verification failed for {ip}:{port} with exception: {e}")
         finally:
             s.close()
+        if response != b'':
+            #output.write_response_to_file(ip, port, response)
+            output.push_to_database(ip, port, response)
+            print(f"[+] response from {ip} {port}:")
+            print(f"{response[0:60]}...")
+
+    def secure_send_and_receive(self, ip: str, port: int):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+
+        context = ssl.SSLContext(ssl_version=ssl.PROTOCOL_TLS) # ciphers="ADH-AES256-SHA"
+        s_socket = context.wrap_socket(s, server_hostname=ip)
+
+        try:
+            s_socket.connect((ip, port))
+        except Exception as e:
+            print(f"[-] connection failed {ip}:{port}: {e}")
+            return
+        response = b''
+        try:
+            response = self.protocol_send_and_receive(s_socket, ip, port)
+        except socket.timeout as e:
+            print(f"[-] verification failed for {ip}:{port} with socket timeout: {e}")
+        except Exception as e:
+            print(f"[-] verification failed for {ip}:{port} with exception: {e}")
+        finally:
+            s_socket.close()
         if response != b'':
             #output.write_response_to_file(ip, port, response)
             output.push_to_database(ip, port, response)
@@ -183,12 +187,12 @@ def str_to_class(classname):
     return getattr(sys.modules[__name__], classname)
 
 @dramatiq.actor(max_age=3600000*24, time_limit=1000*10, notify_shutdown=True)
-def status(ip, port, protocol_str):
+def status(ip, port, protocol_str, secure):
     print(f"[+] verification status: start working on {ip}:{port}")
     try:
         connection = None
         if protocol_str == 'automatic':
-            if port == 80:
+            if port == 80 or port == 443:
                 connection = connection_handler(http)
             elif port == 22:
                 connection = connection_handler(ssh)
@@ -198,7 +202,10 @@ def status(ip, port, protocol_str):
                 connection = connection_handler(colaB)
         else:
             connection = connection_handler(str_to_class(protocol_str))
-        connection.send_and_receive(ip, port)
+        if secure:
+            connection.secure_send_and_receive(ip, port)
+        else:
+            connection.send_and_receive(ip, port)
     except TimeLimitExceeded:
         print(f"[-] verification status: time limit exceeded {ip}:{port}")
     except Shutdown:
@@ -210,7 +217,7 @@ def status(ip, port, protocol_str):
     print(f"[+] verification status: finished {ip}:{port}")
     print_queue_len()
 
-def scan(port=80, protocol_str='automatic'):
+def scan(port=80, protocol_str='automatic', secure=False):
     A = list(range(1, 0xff))
     B = list(range(1, 0xff))
     random.shuffle(A)
@@ -221,6 +228,9 @@ def scan(port=80, protocol_str='automatic'):
             ip_range = f"{a}.{b}.0.0/16"
             ip_ranges.append(ip_range)
     
+    # debug
+    #ip_ranges = ['147.203.215.99']
+
     while True:
         # randomize IP ranges
         random.shuffle(ip_ranges)
@@ -238,7 +248,7 @@ def scan(port=80, protocol_str='automatic'):
                     if 'tcp' in state['proto'] and port == state['port'] and 'open' in state['status']:
                         logging.info(f"found open port: {ip} {state}")
                         print(f"[+] verifying status of {ip}:{port}")
-                        status.send_with_options(args=(ip, port, protocol_str), delay=delay)
+                        status.send_with_options(args=(ip, port, protocol_str, secure), delay=delay)
                         #status.send_with_options(args=(ip, port, )) # without delay
                         print_queue_len()
                         delay += 1000
@@ -250,13 +260,14 @@ def scan(port=80, protocol_str='automatic'):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='masscan the internet')
     parser.add_argument('-p', '--port', dest='port', help='Port to scan', type=int)
-    parser.add_argument('--protocol', dest='protocol_str', help='Define the protocol (http, ssh, colaA, colaB, ...) to use to verify if the service is up', type=str, default='automatic')
+    parser.add_argument('--protocol', dest='protocol_str', help='Define the protocol (http, ssh, colaA, colaB, ...) to use to verify if the service is up.', type=str, default='automatic')
+    parser.add_argument('--secure', dest='secure', action='store_true', help='Use a TLS secured connection to verify the status of the service (wraps the TCP traffic in a TLS tunnel).')
     args = parser.parse_args()
 
     logging.basicConfig(filename=f"./logs/scan-{args.port}.log", filemode="a", format="%(asctime)s %(message)s", level=logging.INFO, force=True)
 
     try:
-        scan(args.port, args.protocol_str)
+        scan(args.port, args.protocol_str, args.secure)
     except KeyboardInterrupt:
         print('\nExitting...')
         sys.exit(1)
