@@ -7,7 +7,6 @@ import time
 import datetime
 import json
 import argparse
-import requests
 import socket
 from functools import reduce
 from abc import ABC, abstractmethod
@@ -38,58 +37,78 @@ class protocol(ABC):
         pass
 
 class http(protocol):
-    def count_words(host: str, port: int) -> bytes:
-        url = f"http://{host}:{port}/"
-        try:
-            response = requests.get(url)
-            count = len(response.text.split(" "))
-            print(f"[+] there are {count} words at {url!r}.")
-            return response.text.encode('utf-8')
-        except Exception as e:
-            print(f"[-] no response from {url!r}: {e}")
-        return b''
-    
-    receive_response = count_words
-    send_request = None
+    def send_http_request(socket, ip: str, port: int):
+        request = f"GET / HTTP/1.1\r\nHost:{ip}\r\nConnection: close\r\n\r\n".encode()
+        socket.sendall(request)
 
-    def send_and_receive(host: str, port: int) -> bytes:
-        return receive_response(str, int)
+    def receive_http_request(socket, ip: str, port: int) -> bytes:
+        response = b""
+        while True:
+            chunk = socket.recv(4096)
+            if len(chunk) == 0:
+                # No more data received, quitting
+                break
+            response = response + chunk
+        return response
 
-class cola(protocol):
-    def send_cola_request(socket, port: int):
+    send_request = send_http_request
+    receive_response = receive_http_request
+
+class colaA(protocol):
+    def send_cola_request(socket, ip: str, port: int):
         #payload = b'sRI 0'
         #payload = b'sRN FirmwareVersion'
         payload = b'sRN DeviceIdent'
-        length = 1024
-        if port == 2112:
-            length = len(payload).to_bytes(4, 'big')
-            crc = reduce(lambda x, y: x ^ y, payload, 0).to_bytes(1, 'big')
-            header = b'\x02\x02\x02\x02'
-            payload = header + length + payload + crc
-        elif port == 2111:
-            payload = b'\x02' + payload + b'\x03'
+        payload = b'\x02' + payload + b'\x03'
         print("[+] Sending payload:")
         print(payload)
         socket.sendall(payload)
 
-    def receive_cola_response(socket, port: int) -> bytes:
-        response = b''
-        if port == 2112:
-            header = socket.recv(4)
-            length = socket.recv(4)
-            length = int.from_bytes(length, byteorder='big')
-            response = socket.recv(length)
-            crc = socket.recv(1)
-        elif port == 2111:
-            response = socket.recv(1024)
+    def receive_cola_response(socket, ip: str, port: int) -> bytes:
+        response = socket.recv(1024)
         return response
 
     send_request = send_cola_request
     receive_response = receive_cola_response
 
-    def send_and_receive(socket, port: int) -> bytes:
-        send_request(socket, port)
-        return receive_response(socket, port)
+class colaB(protocol):
+    def send_cola_request(socket, ip: str, port: int):
+        #payload = b'sRI 0'
+        #payload = b'sRN FirmwareVersion'
+        payload = b'sRN DeviceIdent'
+        length = 1024
+        length = len(payload).to_bytes(4, 'big')
+        crc = reduce(lambda x, y: x ^ y, payload, 0).to_bytes(1, 'big')
+        header = b'\x02\x02\x02\x02'
+        payload = header + length + payload + crc
+        print("[+] Sending payload:")
+        print(payload)
+        socket.sendall(payload)
+
+    def receive_cola_response(socket, ip: str, port: int) -> bytes:
+        header = socket.recv(4)
+        length = socket.recv(4)
+        length = int.from_bytes(length, byteorder='big')
+        response = socket.recv(length)
+        crc = socket.recv(1)
+        return response
+
+    send_request = send_cola_request
+    receive_response = receive_cola_response
+
+class ssh(protocol):
+    def send_ssh_request(socket, ip: str, port: int):
+        pass
+
+    def receive_ssh_response(socket, ip: str, port: int) -> bytes:
+        response = socket.recv(1024)
+        if b"SSH-" in response:
+            return response
+        else:
+            return b""
+
+    send_request = send_ssh_request
+    receive_response = receive_ssh_response
 
 class output:
     @staticmethod
@@ -126,25 +145,14 @@ class output:
             print(data)
             print(f"Error occured: {e}")
 
-class ip_ping:
-    def __init__(self, type_name):
-        self.receive_response = type_name.receive_response
-
-    def send_and_receive(self, ip: str, port: int):
-        response = self.receive_response(ip, port)
-        if response != b'':
-            #output.write_response_to_file(ip, port, response)
-            output.push_to_database(ip, port, response)
-            print(f"[+] response from {ip} {port}:")
-            print(f"{response[0:60]}...")
-
-class tcp_ping:
+class connection_handler:
     def __init__(self, type_name):
         self.send_request = type_name.send_request
         self.receive_response = type_name.receive_response
 
     def send_and_receive(self, ip: str, port: int):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
         try:
             s.connect((ip, port))
         except Exception as e:
@@ -152,8 +160,10 @@ class tcp_ping:
             return
         response = b''
         try:
-            self.send_request(s, port)
-            response = self.receive_response(s, port)
+            self.send_request(s, ip, port)
+            response = self.receive_response(s, ip, port)
+        except socket.timeout as e:
+            print(f"[-] verification failed for {ip}:{port} with socket timeout: {e}")
         except Exception as e:
             print(f"[-] verification failed for {ip}:{port} with exception: {e}")
         finally:
@@ -169,16 +179,26 @@ def print_queue_len():
         queue_len = broker.do_qsize(n)
         print(f"[+] There are currently {queue_len} actors in queue dramatiq:{n}.")
 
+def str_to_class(classname):
+    return getattr(sys.modules[__name__], classname)
+
 @dramatiq.actor(max_age=3600000*24, time_limit=1000*10, notify_shutdown=True)
-def status(ip, port):
+def status(ip, port, protocol_str):
     print(f"[+] verification status: start working on {ip}:{port}")
     try:
-        ping_handler = None
-        if port == 80:
-            ping_handler = ip_ping(http)
-        elif port == 2111 or port == 2112:
-            ping_handler = tcp_ping(cola)
-        ping_handler.send_and_receive(ip, port)
+        connection = None
+        if protocol_str == 'automatic':
+            if port == 80:
+                connection = connection_handler(http)
+            elif port == 22:
+                connection = connection_handler(ssh)
+            elif port == 2111:
+                connection = connection_handler(colaA)
+            elif port == 2112:
+                connection = connection_handler(colaB)
+        else:
+            connection = connection_handler(str_to_class(protocol_str))
+        connection.send_and_receive(ip, port)
     except TimeLimitExceeded:
         print(f"[-] verification status: time limit exceeded {ip}:{port}")
     except Shutdown:
@@ -190,7 +210,7 @@ def status(ip, port):
     print(f"[+] verification status: finished {ip}:{port}")
     print_queue_len()
 
-def scan(port=80):
+def scan(port=80, protocol_str='automatic'):
     A = list(range(1, 0xff))
     B = list(range(1, 0xff))
     random.shuffle(A)
@@ -218,7 +238,7 @@ def scan(port=80):
                     if 'tcp' in state['proto'] and port == state['port'] and 'open' in state['status']:
                         logging.info(f"found open port: {ip} {state}")
                         print(f"[+] verifying status of {ip}:{port}")
-                        status.send_with_options(args=(ip, port, ), delay=delay)
+                        status.send_with_options(args=(ip, port, protocol_str), delay=delay)
                         #status.send_with_options(args=(ip, port, )) # without delay
                         print_queue_len()
                         delay += 1000
@@ -230,12 +250,13 @@ def scan(port=80):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='masscan the internet')
     parser.add_argument('-p', '--port', dest='port', help='Port to scan', type=int)
+    parser.add_argument('--protocol', dest='protocol_str', help='Define the protocol (http, ssh, colaA, colaB, ...) to use to verify if the service is up', type=str, default='automatic')
     args = parser.parse_args()
 
     logging.basicConfig(filename=f"./logs/scan-{args.port}.log", filemode="a", format="%(asctime)s %(message)s", level=logging.INFO, force=True)
 
     try:
-        scan(args.port)
+        scan(args.port, args.protocol_str)
     except KeyboardInterrupt:
         print('\nExitting...')
         sys.exit(1)
