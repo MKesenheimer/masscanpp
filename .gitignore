@@ -7,3 +7,6 @@ logs/
 paused.conf
 redis/
 test-mongo.py
+*.lst
+*.log
+eyewitness/

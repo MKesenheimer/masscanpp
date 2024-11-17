@@ -37,6 +37,7 @@ filtering for results on mongo-express (advanced search):
 - port 80: `{port: 8080}`
 - login in HTTP response: `{response: /login/i}`
 - port 8080 and 200 Status code: `{port: 8080, response: /HTTP\/1.1 200/i}`
+- port 80 or 8080: `{port: , response: /HTTP\/1.1 200/i}`
 - port 22 and SSH response: `{port: 22, response: /SSH-/i}`
 - specific SSH version: `{port: 22, response: /SSH-2.0-OpenSSH_9.2p1/i}`
 - more options: `{response: {$regex: 'Ubuntu', $options: "$i"}}`
@@ -52,4 +53,17 @@ clear all keys from redis:
 ```bash
 redis-cli
 > flushall
+```
+
+
+## EyeWitness
+
+use the provided Dockerfile to build EyeWitness:
+```bash
+docker build --tag eyewitness .
+```
+
+Run EyeWitness on a list of IP addresses:
+```bash
+docker run -it --rm -v $(pwd):/tmp/EyeWitness/ --name eyewitness eyewitness -f ./port8080.lst
 ```
